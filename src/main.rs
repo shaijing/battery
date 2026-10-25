@@ -2,6 +2,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{CommandFactory, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
+use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::os::unix::fs::MetadataExt;
@@ -10,8 +11,10 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::fmt::format::Writer as FormatWriter;
+use tracing_subscriber::fmt::time::FormatTime;
 use tracing_subscriber::fmt::writer::MakeWriter;
 
 const SMC_PATH: &str = "/usr/local/libexec/battery/smc";
@@ -213,6 +216,7 @@ struct BatteryLogMakeWriter;
 struct BatteryLogWriter {
     stderr: io::Stderr,
     file: Option<fs::File>,
+    pending: Vec<u8>,
 }
 
 impl<'a> MakeWriter<'a> for BatteryLogMakeWriter {
@@ -230,13 +234,14 @@ impl<'a> MakeWriter<'a> for BatteryLogMakeWriter {
         BatteryLogWriter {
             stderr: io::stderr(),
             file,
+            pending: Vec::new(),
         }
     }
 }
 
 impl Write for BatteryLogWriter {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        self.stderr.write_all(buffer)?;
+        self.pending.extend_from_slice(buffer);
         if let Some(file) = &mut self.file {
             let _ = file.write_all(buffer);
         }
@@ -244,6 +249,13 @@ impl Write for BatteryLogWriter {
     }
 
     fn flush(&mut self) -> io::Result<()> {
+        let output = if self.stderr.is_terminal() && std::env::var_os("NO_COLOR").is_none() {
+            colorize_log(&self.pending)
+        } else {
+            self.pending.clone()
+        };
+        self.stderr.write_all(&output)?;
+        self.pending.clear();
         self.stderr.flush()?;
         if let Some(file) = &mut self.file {
             let _ = file.flush();
@@ -256,10 +268,40 @@ fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
+        .with_timer(LocalTimer)
         .with_ansi(false)
         .with_target(false)
         .with_writer(BatteryLogMakeWriter)
         .try_init();
+}
+
+struct LocalTimer;
+
+impl FormatTime for LocalTimer {
+    fn format_time(&self, writer: &mut FormatWriter<'_>) -> std::fmt::Result {
+        let seconds = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let timestamp: libc::time_t = seconds.try_into().map_err(|_| std::fmt::Error)?;
+        let mut local = std::mem::MaybeUninit::<libc::tm>::uninit();
+        let result = unsafe { libc::localtime_r(&timestamp, local.as_mut_ptr()) };
+        if result.is_null() {
+            return Err(std::fmt::Error);
+        }
+        let local = unsafe { local.assume_init() };
+        let mut buffer = [0_u8; 64];
+        let length = unsafe {
+            libc::strftime(
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                c"[%Y-%m-%dT%H:%M:%S%z]".as_ptr(),
+                &local,
+            )
+        };
+        let formatted = std::str::from_utf8(&buffer[..length]).map_err(|_| std::fmt::Error)?;
+        writer.write_str(formatted)
+    }
 }
 
 fn run() -> Result<()> {
@@ -651,6 +693,39 @@ fn probe_key(key: &str, expected_type: Option<&str>, expected_len: usize) -> boo
     })
 }
 
+fn colorize_log(bytes: &[u8]) -> Vec<u8> {
+    let text = String::from_utf8_lossy(bytes);
+    let mut output = String::with_capacity(text.len() + 32);
+    for line in text.split_inclusive('\n') {
+        let (marker, level, style) = [
+            (" ERROR ", "ERROR", "1;31"),
+            (" WARN ", "WARN", "1;33"),
+            (" INFO ", "INFO", "1;32"),
+            (" DEBUG ", "DEBUG", "1;36"),
+            (" TRACE ", "TRACE", "2"),
+        ]
+        .into_iter()
+        .find(|(marker, _, _)| line.contains(marker))
+        .unwrap_or(("", "", ""));
+        if marker.is_empty() {
+            output.push_str(line);
+            continue;
+        }
+        let index = line.find(marker).unwrap();
+        let timestamp = line[..index].trim_end();
+        let message_start = index + marker.len();
+        output.push_str("\x1b[2m");
+        output.push_str(timestamp);
+        output.push_str("\x1b[0m  \x1b[");
+        output.push_str(style);
+        output.push('m');
+        output.push_str(level);
+        output.push_str("\x1b[0m  ");
+        output.push_str(&line[message_start..]);
+    }
+    output.into_bytes()
+}
+
 fn smc_capabilities() -> &'static SmcCapabilities {
     SMC_CAPABILITIES.get_or_init(|| {
         let capabilities = SmcCapabilities {
@@ -664,14 +739,30 @@ fn smc_capabilities() -> &'static SmcCapabilities {
             adapter_ch0j: probe_key("CH0J", None, 1),
         };
         if !running_as_root().unwrap_or(false) {
+            let charging = if capabilities.golden_gate {
+                "Golden Gate limit"
+            } else if capabilities.tahoe {
+                "Tahoe control"
+            } else if capabilities.legacy {
+                "legacy control"
+            } else {
+                "unavailable"
+            };
+            let adapter = [
+                capabilities.adapter_chie.then_some("CHIE"),
+                capabilities.adapter_ch0i.then_some("CH0I"),
+                capabilities.adapter_ch0j.then_some("CH0J"),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+            let adapter = if adapter.is_empty() {
+                "unavailable".to_owned()
+            } else {
+                adapter.join(", ")
+            };
             log(&format!(
-                "SMC capabilities: golden_gate={} tahoe={} legacy={} CHIE={} CH0I={} CH0J={}",
-                capabilities.golden_gate,
-                capabilities.tahoe,
-                capabilities.legacy,
-                capabilities.adapter_chie,
-                capabilities.adapter_ch0i,
-                capabilities.adapter_ch0j
+                "SMC support: charging {charging}; adapter {adapter}"
             ));
         }
         capabilities
@@ -995,7 +1086,13 @@ fn show_status() -> Result<()> {
     println!(
         "  {} {}",
         paint(&format!("{:<12}", "Charging"), "1"),
-        status_badge(&status.charging, "enabled", "disabled", "Charging", "Paused")
+        status_badge(
+            &status.charging,
+            "enabled",
+            "disabled",
+            "Charging",
+            "Paused"
+        )
     );
     let adapter = match status.discharging.as_str() {
         "not discharging" => "enabled",
@@ -1197,7 +1294,10 @@ fn maintain(level: String) -> Result<()> {
     bootstrap_launch_agent(&paths.launch_agent)?;
     wait_for_agent_running()?;
     log(&format!("Maintaining battery at {target}%"));
-    println!("{}", paint(&format!("✓ Maintain limit set to {target}%"), "1;32"));
+    println!(
+        "{}",
+        paint(&format!("✓ Maintain limit set to {target}%"), "1;32")
+    );
     Ok(())
 }
 
