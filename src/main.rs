@@ -729,15 +729,17 @@ fn enable_discharging() -> Result<()> {
     let capabilities = smc_capabilities();
     let mut supported = false;
     if capabilities.adapter_ch0i {
-        smc_write_verified("CH0I", &[0x01])?;
+        smc_write("CH0I", &[0x01])?;
         supported = true;
     }
     if capabilities.adapter_chie {
-        smc_write_verified("CHIE", &[0x08])?;
+        smc_write("CHIE", &[0x08])?;
         supported = true;
     }
     if capabilities.adapter_ch0j {
-        smc_write_verified("CH0J", &[0x01])?;
+        // On newer firmware, CH0J reads back the encoded CHIE state (for example 0x28)
+        // rather than the 0x01 command value, so success is determined by the SMC write status.
+        smc_write("CH0J", &[0x01])?;
         supported = true;
     }
     if supported {
@@ -752,15 +754,15 @@ fn disable_discharging() -> Result<()> {
     let capabilities = smc_capabilities();
     let mut supported = false;
     if capabilities.adapter_ch0i {
-        smc_write_verified("CH0I", &[0x00])?;
+        smc_write("CH0I", &[0x00])?;
         supported = true;
     }
     if capabilities.adapter_chie {
-        smc_write_verified("CHIE", &[0x00])?;
+        smc_write("CHIE", &[0x00])?;
         supported = true;
     }
     if capabilities.adapter_ch0j {
-        smc_write_verified("CH0J", &[0x00])?;
+        smc_write("CH0J", &[0x00])?;
         supported = true;
     }
     if supported {
