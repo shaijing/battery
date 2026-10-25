@@ -2,7 +2,6 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{CommandFactory, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
-use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::os::unix::fs::MetadataExt;
@@ -17,7 +16,8 @@ use tracing_subscriber::fmt::format::Writer as FormatWriter;
 use tracing_subscriber::fmt::time::FormatTime;
 use tracing_subscriber::fmt::writer::MakeWriter;
 
-const SMC_PATH: &str = "/usr/local/libexec/battery/smc";
+mod smc;
+
 const ROOT_HELPER_PATH: &str = "/usr/local/libexec/battery/battery-root";
 const LOOP_INTERVAL: Duration = Duration::from_secs(60);
 const AGENT_STOP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -70,6 +70,9 @@ enum Action {
         upper: Option<String>,
         lower: Option<String>,
     },
+    /// Root-only validated raw SMC write wrapper.
+    #[command(name = "smc-write", hide = true)]
+    SmcWrite { key: String, value: String },
 }
 
 #[derive(Clone)]
@@ -128,11 +131,7 @@ struct BatteryStatus {
     maintenance_problem: Option<String>,
 }
 
-#[derive(Debug)]
-struct SmcReading {
-    data_type: String,
-    bytes: Vec<u8>,
-}
+type SmcReading = smc::Reading;
 
 #[derive(Debug)]
 struct SmcCapabilities {
@@ -176,6 +175,7 @@ fn main() {
     init_tracing();
     if let Err(error) = install_signal_handlers().and_then(|()| run()) {
         tracing::error!(target: "battery", error = %error, "command failed");
+        eprintln!("Error: {error:#}");
         std::process::exit(1);
     }
 }
@@ -214,9 +214,7 @@ fn sleep_until_next_check() -> Result<()> {
 struct BatteryLogMakeWriter;
 
 struct BatteryLogWriter {
-    stderr: io::Stderr,
     file: Option<fs::File>,
-    pending: Vec<u8>,
 }
 
 impl<'a> MakeWriter<'a> for BatteryLogMakeWriter {
@@ -231,17 +229,12 @@ impl<'a> MakeWriter<'a> for BatteryLogMakeWriter {
                 .open(paths.log)
                 .ok()
         });
-        BatteryLogWriter {
-            stderr: io::stderr(),
-            file,
-            pending: Vec::new(),
-        }
+        BatteryLogWriter { file }
     }
 }
 
 impl Write for BatteryLogWriter {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        self.pending.extend_from_slice(buffer);
         if let Some(file) = &mut self.file {
             let _ = file.write_all(buffer);
         }
@@ -249,14 +242,6 @@ impl Write for BatteryLogWriter {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        let output = if self.stderr.is_terminal() && std::env::var_os("NO_COLOR").is_none() {
-            colorize_log(&self.pending)
-        } else {
-            self.pending.clone()
-        };
-        self.stderr.write_all(&output)?;
-        self.pending.clear();
-        self.stderr.flush()?;
         if let Some(file) = &mut self.file {
             let _ = file.flush();
         }
@@ -339,6 +324,7 @@ fn run() -> Result<()> {
             upper,
             lower,
         }) => golden_gate_root_action(&operation, upper.as_deref(), lower.as_deref()),
+        Some(Action::SmcWrite { key, value }) => smc_write_root(&key, &value),
     }
 }
 
@@ -419,15 +405,14 @@ fn install_sudoers() -> Result<()> {
     }
 
     let executable = std::env::current_exe().context("cannot locate battery executable")?;
-    let smc_path = sudoers_command_path(Path::new(SMC_PATH))?;
     let helper_path = sudoers_command_path(Path::new(ROOT_HELPER_PATH))?;
     let rules = format!(
         "# Managed by battery visudo. Edit through `battery visudo`.\n\
-Cmnd_Alias BATTERY_CHARGING_ON = {smc_path} -k CH0B -w 00, {smc_path} -k CH0C -w 00, {smc_path} -k CHTE -w 00000000\n\
-Cmnd_Alias BATTERY_CHARGING_OFF = {smc_path} -k CH0B -w 02, {smc_path} -k CH0C -w 02, {smc_path} -k CHTE -w 01000000\n\
-Cmnd_Alias BATTERY_ADAPTER_ON = {smc_path} -k CH0I -w 01, {smc_path} -k CHIE -w 08, {smc_path} -k CH0J -w 01\n\
-Cmnd_Alias BATTERY_ADAPTER_OFF = {smc_path} -k CH0I -w 00, {smc_path} -k CHIE -w 00, {smc_path} -k CH0J -w 00\n\
-{username} ALL=(root) NOPASSWD: BATTERY_CHARGING_ON, BATTERY_CHARGING_OFF, BATTERY_ADAPTER_ON, BATTERY_ADAPTER_OFF\n\
+Cmnd_Alias BATTERY_CHARGING_ON = {helper_path} smc-write CH0B 00, {helper_path} smc-write CH0C 00, {helper_path} smc-write CHTE 00000000\n\
+Cmnd_Alias BATTERY_CHARGING_OFF = {helper_path} smc-write CH0B 02, {helper_path} smc-write CH0C 02, {helper_path} smc-write CHTE 01000000\n\
+Cmnd_Alias BATTERY_ADAPTER_INPUT_OFF = {helper_path} smc-write CH0I 01, {helper_path} smc-write CHIE 08, {helper_path} smc-write CH0J 01\n\
+Cmnd_Alias BATTERY_ADAPTER_INPUT_ON = {helper_path} smc-write CH0I 00, {helper_path} smc-write CHIE 00, {helper_path} smc-write CH0J 00\n\
+{username} ALL=(root) NOPASSWD: BATTERY_CHARGING_ON, BATTERY_CHARGING_OFF, BATTERY_ADAPTER_INPUT_ON, BATTERY_ADAPTER_INPUT_OFF\n\
 # Dynamic Golden Gate values are passed through a root-only Rust wrapper that validates each argument.\n\
 {username} ALL=(root) NOPASSWD: {helper_path} golden-gate *\n"
     );
@@ -441,7 +426,6 @@ Cmnd_Alias BATTERY_ADAPTER_OFF = {smc_path} -k CH0I -w 00, {smc_path} -k CHIE -w
     }
 
     validate_root_owned_directory(Path::new(ROOT_HELPER_PATH).parent().unwrap())?;
-    validate_root_owned_executable(Path::new(SMC_PATH))?;
     sudo_checked(
         vec![
             "install".into(),
@@ -566,57 +550,9 @@ fn log(message: &str) {
 }
 
 fn smc_read(key: &str) -> Result<SmcReading> {
-    let output = Command::new(SMC_PATH)
-        .args(["-k", key, "-r"])
-        .output()
-        .with_context(|| format!("could not execute {SMC_PATH}"))?;
-    if !output.status.success() {
-        bail!(
-            "smc read {key} failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    match parse_smc_value(&text) {
-        Ok(reading) => {
-            tracing::debug!(target: "battery", key, bytes = ?reading.bytes, "SMC key read");
-            Ok(reading)
-        }
-        Err(error) => {
-            tracing::debug!(target: "battery", key, output = %text.trim(), "SMC key has no readable data");
-            Err(error).with_context(|| format!("could not read SMC key {key}: {}", text.trim()))
-        }
-    }
-}
-
-fn parse_smc_value(output: &str) -> Result<SmcReading> {
-    let line = output
-        .lines()
-        .next()
-        .ok_or_else(|| anyhow!("empty smc output"))?;
-    let (type_start, type_end) = (line.rfind('['), line.rfind(']'));
-    let data_type = match (type_start, type_end) {
-        (Some(start), Some(end)) if start < end => line[start + 1..end].trim().to_ascii_lowercase(),
-        _ => String::new(),
-    };
-
-    let byte_text = if let Some(start) = line.find("(bytes") {
-        line[start + "(bytes".len()..]
-            .split_once(')')
-            .map(|(bytes, _)| bytes.trim())
-    } else if !data_type.is_empty() && data_type != "hex_" {
-        type_start
-            .zip(type_end)
-            .map(|(start, end)| line[start + 1..end].trim())
-    } else {
-        line.rsplit_once(':').map(|(_, value)| value.trim())
-    }
-    .ok_or_else(|| anyhow!("SMC returned no data"))?;
-    let bytes = parse_hex_bytes(byte_text)?;
-    if bytes.is_empty() {
-        bail!("SMC returned no data")
-    }
-    Ok(SmcReading { data_type, bytes })
+    let reading = smc::read(key).with_context(|| format!("could not read SMC key {key}"))?;
+    tracing::debug!(target: "battery", key, bytes = ?reading.bytes, "SMC key read");
+    Ok(reading)
 }
 
 fn parse_hex_bytes(value: &str) -> Result<Vec<u8>> {
@@ -640,18 +576,14 @@ fn smc_write(key: &str, bytes: &[u8]) -> Result<()> {
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     tracing::debug!(target: "battery", key, value, "writing SMC key");
-    let mut command = if running_as_root()? {
-        Command::new(SMC_PATH)
-    } else {
-        let mut command = Command::new("sudo");
-        command.arg(SMC_PATH);
-        command
-    };
-    let output = command
-        .args(["-k", key, "-w", &value])
+    if running_as_root()? {
+        return smc::write(key, bytes).with_context(|| format!("writing SMC key {key} failed"));
+    }
+    let output = Command::new("sudo")
+        .args([ROOT_HELPER_PATH, "smc-write", key, &value])
         .stdin(Stdio::inherit())
         .output()
-        .with_context(|| format!("could not run sudo {SMC_PATH}"))?;
+        .context("could not run the privileged SMC write helper")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
@@ -661,6 +593,26 @@ fn smc_write(key: &str, bytes: &[u8]) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn smc_write_root(key: &str, value: &str) -> Result<()> {
+    if !running_as_root()? {
+        bail!("raw SMC writes must run as root");
+    }
+    let bytes = parse_hex_bytes(value)?;
+    let allowed = matches!(
+        (key, bytes.as_slice()),
+        ("CH0B", [0x00] | [0x02])
+            | ("CH0C", [0x00] | [0x02])
+            | ("CHTE", [0x00, 0x00, 0x00, 0x00] | [0x01, 0x00, 0x00, 0x00])
+            | ("CH0I", [0x00] | [0x01])
+            | ("CHIE", [0x00] | [0x08])
+            | ("CH0J", [0x00] | [0x01])
+    );
+    if !allowed {
+        bail!("unsupported privileged SMC write: {key}={value}");
+    }
+    smc::write(key, &bytes).with_context(|| format!("writing SMC key {key} failed"))
 }
 
 fn running_as_root() -> Result<bool> {
@@ -691,39 +643,6 @@ fn probe_key(key: &str, expected_type: Option<&str>, expected_len: usize) -> boo
         reading.bytes.len() == expected_len
             && expected_type.is_none_or(|kind| reading.data_type == kind)
     })
-}
-
-fn colorize_log(bytes: &[u8]) -> Vec<u8> {
-    let text = String::from_utf8_lossy(bytes);
-    let mut output = String::with_capacity(text.len() + 32);
-    for line in text.split_inclusive('\n') {
-        let (marker, level, style) = [
-            (" ERROR ", "ERROR", "1;31"),
-            (" WARN ", "WARN", "1;33"),
-            (" INFO ", "INFO", "1;32"),
-            (" DEBUG ", "DEBUG", "1;36"),
-            (" TRACE ", "TRACE", "2"),
-        ]
-        .into_iter()
-        .find(|(marker, _, _)| line.contains(marker))
-        .unwrap_or(("", "", ""));
-        if marker.is_empty() {
-            output.push_str(line);
-            continue;
-        }
-        let index = line.find(marker).unwrap();
-        let timestamp = line[..index].trim_end();
-        let message_start = index + marker.len();
-        output.push_str("\x1b[2m");
-        output.push_str(timestamp);
-        output.push_str("\x1b[0m  \x1b[");
-        output.push_str(style);
-        output.push('m');
-        output.push_str(level);
-        output.push_str("\x1b[0m  ");
-        output.push_str(&line[message_start..]);
-    }
-    output.into_bytes()
 }
 
 fn smc_capabilities() -> &'static SmcCapabilities {
@@ -761,9 +680,12 @@ fn smc_capabilities() -> &'static SmcCapabilities {
             } else {
                 adapter.join(", ")
             };
-            log(&format!(
-                "SMC support: charging {charging}; adapter {adapter}"
-            ));
+            tracing::debug!(
+                target: "battery",
+                charging,
+                adapter,
+                "detected SMC controls"
+            );
         }
         capabilities
     })
