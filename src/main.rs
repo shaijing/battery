@@ -43,7 +43,7 @@ enum Action {
     Charging { setting: String },
     /// Configure passwordless sudo for this user's supported SMC writes.
     Visudo,
-    /// Enable or disable adapter input (discharging control).
+    /// Enable or disable adapter input power.
     Adapter { setting: String },
     /// Charge until the selected percentage is reached.
     Charge { level: u8 },
@@ -141,7 +141,7 @@ impl AdapterRestoreGuard {
     }
 
     fn restore(&mut self) -> Result<()> {
-        disable_discharging()?;
+        enable_adapter_input()?;
         self.armed = false;
         Ok(())
     }
@@ -150,7 +150,7 @@ impl AdapterRestoreGuard {
 impl Drop for AdapterRestoreGuard {
     fn drop(&mut self) {
         if self.armed
-            && let Err(error) = disable_discharging()
+            && let Err(error) = enable_adapter_input()
         {
             tracing::error!(target: "battery", error = %error, "could not restore adapter input after discharge");
         }
@@ -763,8 +763,7 @@ fn write_golden_gate_limit(upper: u8, lower: u8) -> Result<()> {
 
 fn enable_charging() -> Result<()> {
     log("Enabling battery charging");
-    enable_charging_smc()?;
-    disable_discharging()
+    enable_charging_smc()
 }
 
 fn disable_charging() -> Result<()> {
@@ -786,8 +785,8 @@ fn disable_charging() -> Result<()> {
     }
 }
 
-fn enable_discharging() -> Result<()> {
-    log("Enabling battery discharging");
+fn disable_adapter_input() -> Result<()> {
+    log("Disabling adapter input; battery will supply power");
     let capabilities = smc_capabilities();
     let mut supported = false;
     if capabilities.adapter_ch0i {
@@ -811,8 +810,8 @@ fn enable_discharging() -> Result<()> {
     }
 }
 
-fn disable_discharging() -> Result<()> {
-    log("Disabling battery discharging");
+fn enable_adapter_input() -> Result<()> {
+    log("Enabling adapter input");
     let capabilities = smc_capabilities();
     let mut supported = false;
     if capabilities.adapter_ch0i {
@@ -1009,12 +1008,14 @@ fn set_charging(setting: &str) -> Result<()> {
 
 fn set_adapter(setting: &str) -> Result<()> {
     let enabled = validate_setting(setting)?;
-    stop_maintenance()?;
+    clear_maintenance()?;
     if enabled {
-        enable_discharging()
+        // Adapter control is independent of the battery charging limit.
+        enable_adapter_input()?;
     } else {
-        disable_discharging()
+        disable_adapter_input()?;
     }
+    show_status()
 }
 
 fn validate_level(level: u8) -> Result<u8> {
@@ -1040,10 +1041,10 @@ fn wait_for_level(level: u8, charging: bool) -> Result<()> {
         Some(AdapterRestoreGuard::new())
     };
     if charging {
-        disable_discharging()?;
+        enable_adapter_input()?;
         enable_charging()?;
     } else {
-        enable_discharging()?;
+        disable_adapter_input()?;
     }
     loop {
         check_shutdown()?;
@@ -1113,7 +1114,7 @@ fn maintain_loop(level: &str) -> Result<()> {
     };
     let _adapter_restore = AdapterRestoreGuard::new();
     // A previous worker may have exited while adapter input was disabled.
-    disable_discharging()?;
+    enable_adapter_input()?;
     let (initial, _) = battery_reading()?;
     if initial.parse::<u8>().unwrap_or(0) > target {
         log(&format!(
@@ -1124,7 +1125,7 @@ fn maintain_loop(level: &str) -> Result<()> {
     loop {
         check_shutdown()?;
         if discharging_status() != "not discharging" {
-            disable_discharging()?;
+            enable_adapter_input()?;
         }
         let (raw, _) = battery_reading()?;
         let current: u8 = raw.parse().context("invalid battery percentage")?;
@@ -1140,17 +1141,23 @@ fn maintain_loop(level: &str) -> Result<()> {
     }
 }
 
-fn stop_maintenance() -> Result<()> {
+fn clear_maintenance() -> Result<()> {
     let paths = paths()?;
-    log("Stopping battery maintenance and enabling charging");
+    log("Stopping battery maintenance");
     unload_launch_agent()?;
-    enable_charging()?;
     let mut config = load_config(&paths)?;
     config.maintenance.target = None;
     save_config(&paths, &config)?;
     if paths.launch_agent.exists() {
         fs::remove_file(&paths.launch_agent).context("cannot remove launch agent plist")?;
     }
+    Ok(())
+}
+
+fn stop_maintenance() -> Result<()> {
+    clear_maintenance()?;
+    log("Enabling battery charging");
+    enable_charging()?;
     show_status()
 }
 
