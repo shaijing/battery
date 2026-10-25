@@ -3,7 +3,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -985,23 +985,55 @@ fn current_status() -> Result<BatteryStatus> {
 
 fn show_status() -> Result<()> {
     let status = current_status()?;
-    log(&format!(
-        "Battery at {}% ({} remaining), charging {}",
-        status.percentage, status.remaining, status.charging
-    ));
+    println!("{}", paint("🔋 Battery status", "1;36"));
+    println!(
+        "  {} {}%  {}",
+        paint(&format!("{:<12}", "Charge"), "1"),
+        status.percentage,
+        paint(&format!("({})", status.remaining), "2")
+    );
+    println!(
+        "  {} {}",
+        paint(&format!("{:<12}", "Charging"), "1"),
+        status_badge(&status.charging, "enabled", "disabled", "Charging", "Paused")
+    );
+    let adapter = match status.discharging.as_str() {
+        "not discharging" => "enabled",
+        "discharging" => "disabled",
+        _ => "unknown",
+    };
+    println!(
+        "  {} {}",
+        paint(&format!("{:<12}", "Adapter"), "1"),
+        status_badge(adapter, "enabled", "disabled", "Input on", "Input off")
+    );
     if !status.maintain_percentage.is_empty() {
         println!(
-            "Your battery is currently being maintained at {}%",
-            status.maintain_percentage
+            "  {} {}%",
+            paint(&format!("{:<12}", "Maintain"), "1"),
+            paint(&status.maintain_percentage, "1;36")
         );
     }
     if let Some(problem) = status.maintenance_problem {
-        eprintln!("{problem}");
-    }
-    if status.discharging == "discharging" {
-        println!("Adapter input is disabled; battery is discharging");
+        eprintln!("{} {problem}", paint("⚠", "1;33"));
     }
     Ok(())
+}
+
+fn paint(text: &str, style: &str) -> String {
+    if io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none() {
+        format!("\x1b[{style}m{text}\x1b[0m")
+    } else {
+        text.to_owned()
+    }
+}
+
+fn status_badge(value: &str, on: &str, off: &str, on_label: &str, off_label: &str) -> String {
+    match value {
+        value if value == on => paint(&format!("● {on_label}"), "1;32"),
+        value if value == off => paint(&format!("● {off_label}"), "1;33"),
+        _ => paint("● Unknown", "1;31"),
+    }
 }
 
 fn status_csv() -> Result<()> {
@@ -1033,7 +1065,19 @@ fn set_charging(setting: &str) -> Result<()> {
     } else {
         disable_charging()?;
     }
-    save_control_setting(|controls| controls.charging = Some(enabled))
+    save_control_setting(|controls| controls.charging = Some(enabled))?;
+    println!(
+        "{}",
+        paint(
+            if enabled {
+                "✓ Battery charging enabled"
+            } else {
+                "✓ Battery charging paused"
+            },
+            "1;32"
+        )
+    );
+    Ok(())
 }
 
 fn set_adapter(setting: &str) -> Result<()> {
@@ -1045,6 +1089,17 @@ fn set_adapter(setting: &str) -> Result<()> {
         disable_adapter_input()?;
     }
     save_control_setting(|controls| controls.adapter = Some(enabled))?;
+    println!(
+        "{}",
+        paint(
+            if enabled {
+                "✓ Adapter input enabled"
+            } else {
+                "✓ Adapter input disabled; battery supplies power"
+            },
+            "1;32"
+        )
+    );
     show_status()
 }
 
@@ -1142,6 +1197,7 @@ fn maintain(level: String) -> Result<()> {
     bootstrap_launch_agent(&paths.launch_agent)?;
     wait_for_agent_running()?;
     log(&format!("Maintaining battery at {target}%"));
+    println!("{}", paint(&format!("✓ Maintain limit set to {target}%"), "1;32"));
     Ok(())
 }
 
