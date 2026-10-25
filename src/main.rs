@@ -1,14 +1,20 @@
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{CommandFactory, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
+use std::ffi::OsString;
 use std::fs;
+use std::io::{self, Write};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use std::thread;
 use std::time::Duration;
+use tracing_subscriber::EnvFilter;
+use tracing_subscriber::fmt::writer::MakeWriter;
 
 const SMC_PATH: &str = "/usr/local/libexec/battery/smc";
+const ROOT_HELPER_PATH: &str = "/usr/local/libexec/battery/battery-root";
 const LOOP_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Parser)]
@@ -31,6 +37,8 @@ enum Action {
     Maintain { level: String },
     /// Manually enable or disable battery charging.
     Charging { setting: String },
+    /// Configure passwordless sudo for this user's supported SMC writes.
+    Visudo,
     /// Enable or disable adapter input (discharging control).
     Adapter { setting: String },
     /// Charge until the selected percentage is reached.
@@ -48,6 +56,13 @@ enum Action {
     /// Internal launchd maintenance worker; restores the saved target.
     #[command(name = "maintain-recover", hide = true)]
     MaintainRecover,
+    /// Root-only validated SMC write wrapper for dynamic Golden Gate limits.
+    #[command(name = "golden-gate", hide = true)]
+    GoldenGate {
+        operation: String,
+        upper: Option<String>,
+        lower: Option<String>,
+    },
 }
 
 #[derive(Clone)]
@@ -114,10 +129,65 @@ struct SmcCapabilities {
 static SMC_CAPABILITIES: OnceLock<SmcCapabilities> = OnceLock::new();
 
 fn main() {
+    init_tracing();
     if let Err(error) = run() {
-        eprintln!("battery: {error:#}");
+        tracing::error!(target: "battery", error = %error, "command failed");
         std::process::exit(1);
     }
+}
+
+struct BatteryLogMakeWriter;
+
+struct BatteryLogWriter {
+    stderr: io::Stderr,
+    file: Option<fs::File>,
+}
+
+impl<'a> MakeWriter<'a> for BatteryLogMakeWriter {
+    type Writer = BatteryLogWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        let file = Paths::new().ok().and_then(|paths| {
+            fs::create_dir_all(&paths.config).ok()?;
+            fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(paths.log)
+                .ok()
+        });
+        BatteryLogWriter {
+            stderr: io::stderr(),
+            file,
+        }
+    }
+}
+
+impl Write for BatteryLogWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.stderr.write_all(buffer)?;
+        if let Some(file) = &mut self.file {
+            let _ = file.write_all(buffer);
+        }
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.stderr.flush()?;
+        if let Some(file) = &mut self.file {
+            let _ = file.flush();
+        }
+        Ok(())
+    }
+}
+
+fn init_tracing() {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_ansi(false)
+        .with_target(false)
+        .with_writer(BatteryLogMakeWriter)
+        .try_init();
 }
 
 fn run() -> Result<()> {
@@ -136,6 +206,7 @@ fn run() -> Result<()> {
             Ok(())
         }
         Some(Action::Charging { setting }) => set_charging(&setting),
+        Some(Action::Visudo) => install_sudoers(),
         Some(Action::Adapter { setting }) => set_adapter(&setting),
         Some(Action::Charge { level }) => charge_to(level),
         Some(Action::Discharge { level }) => discharge_to(level),
@@ -149,6 +220,11 @@ fn run() -> Result<()> {
                 .context("no saved maintenance target in ~/.battery/config.toml")?;
             maintain_loop(&target.to_string())
         }
+        Some(Action::GoldenGate {
+            operation,
+            upper,
+            lower,
+        }) => golden_gate_root_action(&operation, upper.as_deref(), lower.as_deref()),
     }
 }
 
@@ -207,24 +283,171 @@ fn save_config(paths: &Paths, config: &AppConfig) -> Result<()> {
         .with_context(|| format!("cannot replace config {}", paths.config_file.display()))
 }
 
-fn log(message: &str) {
-    let stamp = Command::new("date")
-        .arg("+%Y-%m-%d %H:%M:%S")
+fn install_sudoers() -> Result<()> {
+    let paths = paths()?;
+    let user_output = Command::new("/usr/bin/id")
+        .arg("-un")
         .output()
-        .ok()
-        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
-        .unwrap_or_else(|| "battery".to_owned());
-    let line = format!("{stamp} - {message}");
-    println!("{line}");
-    if let Ok(paths) = paths() {
-        let _ = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(paths.log)
-            .and_then(|mut file| {
-                std::io::Write::write_all(&mut file, format!("{line}\n").as_bytes())
-            });
+        .context("cannot determine current user name")?;
+    if !user_output.status.success() {
+        bail!("id -un failed");
     }
+    let username = String::from_utf8_lossy(&user_output.stdout)
+        .trim()
+        .to_owned();
+    if username.is_empty()
+        || !username
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+    {
+        bail!("current user name cannot be safely represented in sudoers");
+    }
+
+    let executable = std::env::current_exe().context("cannot locate battery executable")?;
+    let smc_path = sudoers_command_path(Path::new(SMC_PATH))?;
+    let helper_path = sudoers_command_path(Path::new(ROOT_HELPER_PATH))?;
+    let rules = format!(
+        "# Managed by battery visudo. Edit through `battery visudo`.\n\
+Cmnd_Alias BATTERY_CHARGING_ON = {smc_path} -k CH0B -w 00, {smc_path} -k CH0C -w 00, {smc_path} -k CHTE -w 00000000\n\
+Cmnd_Alias BATTERY_CHARGING_OFF = {smc_path} -k CH0B -w 02, {smc_path} -k CH0C -w 02, {smc_path} -k CHTE -w 01000000\n\
+Cmnd_Alias BATTERY_ADAPTER_ON = {smc_path} -k CH0I -w 01, {smc_path} -k CHIE -w 08, {smc_path} -k CH0J -w 01\n\
+Cmnd_Alias BATTERY_ADAPTER_OFF = {smc_path} -k CH0I -w 00, {smc_path} -k CHIE -w 00, {smc_path} -k CH0J -w 00\n\
+{username} ALL=(root) NOPASSWD: BATTERY_CHARGING_ON, BATTERY_CHARGING_OFF, BATTERY_ADAPTER_ON, BATTERY_ADAPTER_OFF\n\
+# Dynamic Golden Gate values are passed through a root-only Rust wrapper that validates each argument.\n\
+{username} ALL=(root) NOPASSWD: {helper_path} golden-gate *\n"
+    );
+    let validation = Command::new("sudo")
+        .arg("-v")
+        .stdin(Stdio::inherit())
+        .status()
+        .context("could not run sudo to install sudoers rules")?;
+    if !validation.success() {
+        bail!("sudo authentication failed; sudoers was not changed");
+    }
+
+    validate_root_owned_directory(Path::new(ROOT_HELPER_PATH).parent().unwrap())?;
+    validate_root_owned_executable(Path::new(SMC_PATH))?;
+    sudo_checked(
+        vec![
+            "install".into(),
+            "-o".into(),
+            "root".into(),
+            "-g".into(),
+            "wheel".into(),
+            "-m".into(),
+            "0755".into(),
+            executable.as_os_str().to_owned(),
+            ROOT_HELPER_PATH.into(),
+        ],
+        "install root-owned SMC helper",
+    )?;
+    validate_root_owned_executable(Path::new(ROOT_HELPER_PATH))?;
+
+    let temporary = paths.config.join("sudoers.tmp");
+    fs::write(&temporary, rules).context("cannot write temporary sudoers file")?;
+
+    sudo_checked(
+        vec![
+            "visudo".into(),
+            "-c".into(),
+            "-f".into(),
+            temporary.as_os_str().to_owned(),
+        ],
+        "validate temporary sudoers file",
+    )?;
+    sudo_checked(
+        vec!["mkdir".into(), "-p".into(), "/private/etc/sudoers.d".into()],
+        "create sudoers directory",
+    )?;
+    sudo_checked(
+        vec![
+            "install".into(),
+            "-o".into(),
+            "root".into(),
+            "-g".into(),
+            "wheel".into(),
+            "-m".into(),
+            "0440".into(),
+            temporary.as_os_str().to_owned(),
+            "/private/etc/sudoers.d/battery".into(),
+        ],
+        "install sudoers rules",
+    )?;
+    sudo_checked(
+        vec!["visudo".into(), "-c".into()],
+        "validate installed sudoers configuration",
+    )?;
+    let _ = fs::remove_file(&temporary);
+    println!("Installed and validated sudoers rules for {username}.");
+    Ok(())
+}
+
+fn sudoers_command_path(path: &Path) -> Result<String> {
+    let path = path
+        .to_str()
+        .context("sudoers executable path is not valid UTF-8")?;
+    if !path.starts_with('/')
+        || path
+            .chars()
+            .any(|ch| ch.is_whitespace() || matches!(ch, ',' | '#' | '\\' | '*' | '?' | '[' | ']'))
+    {
+        bail!("executable path cannot be safely represented in sudoers: {path}");
+    }
+    Ok(path.to_owned())
+}
+
+fn validate_root_owned_directory(path: &Path) -> Result<()> {
+    for ancestor in path.ancestors() {
+        let metadata = fs::metadata(ancestor)
+            .with_context(|| format!("cannot inspect {}", ancestor.display()))?;
+        if !metadata.is_dir() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+            bail!(
+                "refusing passwordless sudo because {} is not a root-owned, non-writable directory",
+                ancestor.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_root_owned_executable(path: &Path) -> Result<()> {
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("cannot inspect executable {}", path.display()))?;
+    if !metadata.is_file()
+        || metadata.uid() != 0
+        || metadata.mode() & 0o022 != 0
+        || metadata.mode() & 0o111 == 0
+    {
+        bail!(
+            "refusing passwordless sudo because {} is not a root-owned, non-writable executable",
+            path.display()
+        );
+    }
+    if let Some(parent) = path.parent() {
+        validate_root_owned_directory(parent)?;
+    }
+    Ok(())
+}
+
+fn sudo_checked(args: Vec<OsString>, description: &str) -> Result<()> {
+    let output = Command::new("sudo")
+        .args(args)
+        .stdin(Stdio::inherit())
+        .output()
+        .with_context(|| format!("could not {description}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    bail!(
+        "could not {description}: {}",
+        if stderr.is_empty() { stdout } else { stderr }
+    )
+}
+
+fn log(message: &str) {
+    tracing::info!(target: "battery", message = %message);
 }
 
 fn smc_read(key: &str) -> Result<SmcReading> {
@@ -239,7 +462,16 @@ fn smc_read(key: &str) -> Result<SmcReading> {
         );
     }
     let text = String::from_utf8_lossy(&output.stdout);
-    parse_smc_value(&text).with_context(|| format!("could not read SMC key {key}: {}", text.trim()))
+    match parse_smc_value(&text) {
+        Ok(reading) => {
+            tracing::debug!(target: "battery", key, bytes = ?reading.bytes, "SMC key read");
+            Ok(reading)
+        }
+        Err(error) => {
+            tracing::debug!(target: "battery", key, output = %text.trim(), "SMC key has no readable data");
+            Err(error).with_context(|| format!("could not read SMC key {key}: {}", text.trim()))
+        }
+    }
 }
 
 fn parse_smc_value(output: &str) -> Result<SmcReading> {
@@ -292,8 +524,16 @@ fn smc_write(key: &str, bytes: &[u8]) -> Result<()> {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-    let output = Command::new("sudo")
-        .args([SMC_PATH, "-k", key, "-w", &value])
+    tracing::debug!(target: "battery", key, value, "writing SMC key");
+    let mut command = if running_as_root()? {
+        Command::new(SMC_PATH)
+    } else {
+        let mut command = Command::new("sudo");
+        command.arg(SMC_PATH);
+        command
+    };
+    let output = command
+        .args(["-k", key, "-w", &value])
         .stdin(Stdio::inherit())
         .output()
         .with_context(|| format!("could not run sudo {SMC_PATH}"))?;
@@ -306,6 +546,17 @@ fn smc_write(key: &str, bytes: &[u8]) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn running_as_root() -> Result<bool> {
+    let output = Command::new("/usr/bin/id")
+        .arg("-u")
+        .output()
+        .context("cannot determine effective user ID")?;
+    if !output.status.success() {
+        bail!("id -u failed");
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim() == "0")
 }
 
 fn smc_write_verified(key: &str, bytes: &[u8]) -> Result<()> {
@@ -339,15 +590,17 @@ fn smc_capabilities() -> &'static SmcCapabilities {
             adapter_ch0i: probe_key("CH0I", None, 1),
             adapter_ch0j: probe_key("CH0J", None, 1),
         };
-        log(&format!(
-            "SMC capabilities: golden_gate={} tahoe={} legacy={} CHIE={} CH0I={} CH0J={}",
-            capabilities.golden_gate,
-            capabilities.tahoe,
-            capabilities.legacy,
-            capabilities.adapter_chie,
-            capabilities.adapter_ch0i,
-            capabilities.adapter_ch0j
-        ));
+        if !running_as_root().unwrap_or(false) {
+            log(&format!(
+                "SMC capabilities: golden_gate={} tahoe={} legacy={} CHIE={} CH0I={} CH0J={}",
+                capabilities.golden_gate,
+                capabilities.tahoe,
+                capabilities.legacy,
+                capabilities.adapter_chie,
+                capabilities.adapter_ch0i,
+                capabilities.adapter_ch0j
+            ));
+        }
         capabilities
     })
 }
@@ -355,7 +608,7 @@ fn smc_capabilities() -> &'static SmcCapabilities {
 fn enable_charging_smc() -> Result<()> {
     let capabilities = smc_capabilities();
     if capabilities.golden_gate {
-        smc_write_verified("bfF0", &[0x00])
+        run_golden_gate_privileged("reset", None, None)
     } else if capabilities.tahoe {
         smc_write_verified("CHTE", &[0x00, 0x00, 0x00, 0x00])
     } else if capabilities.legacy {
@@ -366,7 +619,7 @@ fn enable_charging_smc() -> Result<()> {
     }
 }
 
-fn write_golden_gate_limit(upper: u8, lower: u8) -> Result<()> {
+fn write_golden_gate_limit_raw(upper: u8, lower: u8) -> Result<()> {
     if upper < 2 || upper > 100 || lower == 0 || lower >= upper {
         bail!("invalid Golden Gate charging range: lower={lower}, upper={upper}");
     }
@@ -382,6 +635,68 @@ fn write_golden_gate_limit(upper: u8, lower: u8) -> Result<()> {
         let _ = smc_write_verified("bfF0", &[0x00]);
     }
     update
+}
+
+fn golden_gate_root_action(
+    operation: &str,
+    upper: Option<&str>,
+    lower: Option<&str>,
+) -> Result<()> {
+    if !running_as_root()? {
+        bail!("Golden Gate SMC operations must run as root");
+    }
+    if !smc_capabilities().golden_gate {
+        bail!("Golden Gate SMC keys are unavailable on this machine");
+    }
+    match (operation, upper, lower) {
+        ("reset", None, None) => smc_write_verified("bfF0", &[0x00]),
+        ("set", Some(upper), Some(lower)) => {
+            let upper = upper
+                .parse::<u8>()
+                .context("upper limit must be an integer")?;
+            let lower = lower
+                .parse::<u8>()
+                .context("lower limit must be an integer")?;
+            write_golden_gate_limit_raw(upper, lower)
+        }
+        _ => bail!("invalid Golden Gate operation"),
+    }
+}
+
+fn run_golden_gate_privileged(operation: &str, upper: Option<u8>, lower: Option<u8>) -> Result<()> {
+    if running_as_root()? {
+        let upper = upper.map(|value| value.to_string());
+        let lower = lower.map(|value| value.to_string());
+        return golden_gate_root_action(operation, upper.as_deref(), lower.as_deref());
+    }
+    let mut command = Command::new("sudo");
+    command
+        .arg(ROOT_HELPER_PATH)
+        .arg("golden-gate")
+        .arg(operation);
+    if let Some(upper) = upper {
+        command.arg(upper.to_string());
+    }
+    if let Some(lower) = lower {
+        command.arg(lower.to_string());
+    }
+    let output = command
+        .stdin(Stdio::inherit())
+        .output()
+        .context("could not run privileged Golden Gate operation")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        bail!(
+            "Golden Gate operation failed: {}",
+            if stderr.is_empty() { stdout } else { stderr }
+        );
+    }
+    Ok(())
+}
+
+fn write_golden_gate_limit(upper: u8, lower: u8) -> Result<()> {
+    run_golden_gate_privileged("set", Some(upper), Some(lower))
 }
 
 fn enable_charging() -> Result<()> {
@@ -748,13 +1063,10 @@ fn install_launch_agent(paths: &Paths) -> Result<()> {
 <plist version="1.0"><dict>
 <key>Label</key><string>com.battery.app</string>
 <key>ProgramArguments</key><array><string>{}</string><string>maintain-recover</string></array>
-<key>StandardOutPath</key><string>{}</string><key>StandardErrorPath</key><string>{}</string>
 <key>RunAtLoad</key><true/>
 </dict></plist>
 "#,
-        xml_escape(&executable.to_string_lossy()),
-        xml_escape(&paths.log.to_string_lossy()),
-        xml_escape(&paths.log.to_string_lossy())
+        xml_escape(&executable.to_string_lossy())
     );
     fs::write(&paths.launch_agent, plist).context("cannot write launch agent")
 }
