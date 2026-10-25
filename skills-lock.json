@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "git-commit": {
+      "source": "shaijing/skill-hub",
+      "sourceType": "github",
+      "skillPath": "skills/git-commit/SKILL.md",
+      "computedHash": "fb2ccfd06123b8d748f31cbbb17ef0d633603a5dcc8fcad05b562c0789f14ae4"
+    }
+  }
+}
