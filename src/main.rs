@@ -7,15 +7,19 @@ use std::io::{self, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::writer::MakeWriter;
 
 const SMC_PATH: &str = "/usr/local/libexec/battery/smc";
 const ROOT_HELPER_PATH: &str = "/usr/local/libexec/battery/battery-root";
 const LOOP_INTERVAL: Duration = Duration::from_secs(60);
+const AGENT_STOP_TIMEOUT: Duration = Duration::from_secs(10);
+
+static SHUTDOWN_REQUESTED: OnceLock<Arc<AtomicBool>> = OnceLock::new();
 
 #[derive(Parser)]
 #[command(
@@ -108,6 +112,7 @@ struct BatteryStatus {
     charging: String,
     discharging: String,
     maintain_percentage: String,
+    maintenance_problem: Option<String>,
 }
 
 #[derive(Debug)]
@@ -126,13 +131,70 @@ struct SmcCapabilities {
     adapter_ch0j: bool,
 }
 
+struct AdapterRestoreGuard {
+    armed: bool,
+}
+
+impl AdapterRestoreGuard {
+    fn new() -> Self {
+        Self { armed: true }
+    }
+
+    fn restore(&mut self) -> Result<()> {
+        disable_discharging()?;
+        self.armed = false;
+        Ok(())
+    }
+}
+
+impl Drop for AdapterRestoreGuard {
+    fn drop(&mut self) {
+        if self.armed
+            && let Err(error) = disable_discharging()
+        {
+            tracing::error!(target: "battery", error = %error, "could not restore adapter input after discharge");
+        }
+    }
+}
+
 static SMC_CAPABILITIES: OnceLock<SmcCapabilities> = OnceLock::new();
 
 fn main() {
     init_tracing();
-    if let Err(error) = run() {
+    if let Err(error) = install_signal_handlers().and_then(|()| run()) {
         tracing::error!(target: "battery", error = %error, "command failed");
         std::process::exit(1);
+    }
+}
+
+fn install_signal_handlers() -> Result<()> {
+    let requested = Arc::new(AtomicBool::new(false));
+    signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&requested))?;
+    signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&requested))?;
+    SHUTDOWN_REQUESTED
+        .set(requested)
+        .map_err(|_| anyhow!("signal handlers were already installed"))
+}
+
+fn check_shutdown() -> Result<()> {
+    if SHUTDOWN_REQUESTED
+        .get()
+        .is_some_and(|requested| requested.load(Ordering::Relaxed))
+    {
+        bail!("interrupted");
+    }
+    Ok(())
+}
+
+fn sleep_until_next_check() -> Result<()> {
+    let deadline = Instant::now() + LOOP_INTERVAL;
+    loop {
+        check_shutdown()?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(());
+        }
+        thread::sleep(remaining.min(Duration::from_millis(200)));
     }
 }
 
@@ -861,17 +923,35 @@ fn battery_reading() -> Result<(String, String)> {
 
 fn current_status() -> Result<BatteryStatus> {
     let (percentage, remaining) = battery_reading()?;
-    let maintain_percentage = load_config(&paths()?)?
+    let (maintain_percentage, maintenance_problem) = match load_config(&paths()?)?
         .maintenance
         .target
-        .map(|target| target.to_string())
-        .unwrap_or_default();
+    {
+        Some(target) => match launch_agent_state() {
+            Ok(Some(state)) if state == "running" => (target.to_string(), None),
+            Ok(state) => (
+                String::new(),
+                Some(format!(
+                    "Maintenance target {target}% is configured, but the agent is {}",
+                    state.unwrap_or_else(|| "not loaded".to_owned())
+                )),
+            ),
+            Err(error) => (
+                String::new(),
+                Some(format!(
+                    "Maintenance target {target}% is configured, but the agent could not be checked: {error}"
+                )),
+            ),
+        },
+        None => (String::new(), None),
+    };
     Ok(BatteryStatus {
         percentage,
         remaining,
         charging: charging_status(),
         discharging: discharging_status(),
         maintain_percentage,
+        maintenance_problem,
     })
 }
 
@@ -886,6 +966,9 @@ fn show_status() -> Result<()> {
             "Your battery is currently being maintained at {}%",
             status.maintain_percentage
         );
+    }
+    if let Some(problem) = status.maintenance_problem {
+        eprintln!("{problem}");
     }
     if status.discharging == "discharging" {
         println!("Adapter input is disabled; battery is discharging");
@@ -944,11 +1027,18 @@ fn validate_level(level: u8) -> Result<u8> {
 
 fn wait_for_level(level: u8, charging: bool) -> Result<()> {
     let level = validate_level(level)?;
+    check_shutdown()?;
     let (initial, _) = battery_reading()?;
     log(&format!(
         "{} to {level}% from {initial}%",
         if charging { "Charging" } else { "Discharging" }
     ));
+    let mut adapter_restore = if charging {
+        None
+    } else {
+        // Arm before the first write so partial SMC updates are also restored.
+        Some(AdapterRestoreGuard::new())
+    };
     if charging {
         disable_discharging()?;
         enable_charging()?;
@@ -956,18 +1046,19 @@ fn wait_for_level(level: u8, charging: bool) -> Result<()> {
         enable_discharging()?;
     }
     loop {
+        check_shutdown()?;
         let (raw, _) = battery_reading()?;
         let current: u8 = raw.parse().context("invalid battery percentage")?;
         log(&format!("Battery at {current}% (target {level}%)"));
         if (charging && current >= level) || (!charging && current <= level) {
             break;
         }
-        thread::sleep(LOOP_INTERVAL);
+        sleep_until_next_check()?;
     }
     if charging {
         disable_charging()?;
     } else {
-        disable_discharging()?;
+        adapter_restore.as_mut().unwrap().restore()?;
     }
     log(&format!(
         "{} completed",
@@ -982,6 +1073,7 @@ fn charge_to(level: u8) -> Result<()> {
 }
 
 fn discharge_to(level: u8) -> Result<()> {
+    stop_maintenance()?;
     wait_for_level(level, false)
 }
 
@@ -998,12 +1090,13 @@ fn maintain(level: String) -> Result<()> {
     }
     let target = parse_target(&level)?;
     let paths = paths()?;
-    unload_launch_agent(&paths.launch_agent);
+    unload_launch_agent()?;
     let mut config = load_config(&paths)?;
     config.maintenance.target = Some(target);
     save_config(&paths, &config)?;
     install_launch_agent(&paths)?;
     bootstrap_launch_agent(&paths.launch_agent)?;
+    wait_for_agent_running()?;
     log(&format!("Maintaining battery at {target}%"));
     Ok(())
 }
@@ -1018,14 +1111,21 @@ fn maintain_loop(level: &str) -> Result<()> {
     } else {
         parse_target(level)?
     };
-    log(&format!(
-        "Discharging to {target}% before starting maintenance"
-    ));
+    let _adapter_restore = AdapterRestoreGuard::new();
+    // A previous worker may have exited while adapter input was disabled.
+    disable_discharging()?;
     let (initial, _) = battery_reading()?;
     if initial.parse::<u8>().unwrap_or(0) > target {
+        log(&format!(
+            "Discharging to {target}% before starting maintenance"
+        ));
         wait_for_level(target, false)?;
     }
     loop {
+        check_shutdown()?;
+        if discharging_status() != "not discharging" {
+            disable_discharging()?;
+        }
         let (raw, _) = battery_reading()?;
         let current: u8 = raw.parse().context("invalid battery percentage")?;
         let charging = charging_status();
@@ -1036,19 +1136,21 @@ fn maintain_loop(level: &str) -> Result<()> {
             log(&format!("Charge below {target}%; enabling charging"));
             enable_charging()?;
         }
-        thread::sleep(LOOP_INTERVAL);
+        sleep_until_next_check()?;
     }
 }
 
 fn stop_maintenance() -> Result<()> {
     let paths = paths()?;
     log("Stopping battery maintenance and enabling charging");
-    unload_launch_agent(&paths.launch_agent);
+    unload_launch_agent()?;
+    enable_charging()?;
     let mut config = load_config(&paths)?;
     config.maintenance.target = None;
     save_config(&paths, &config)?;
-    let _ = fs::remove_file(&paths.launch_agent);
-    enable_charging()?;
+    if paths.launch_agent.exists() {
+        fs::remove_file(&paths.launch_agent).context("cannot remove launch agent plist")?;
+    }
     show_status()
 }
 
@@ -1082,13 +1184,41 @@ fn xml_escape(input: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-fn launchctl(args: &[&str], plist: &Path) -> Result<()> {
+fn launch_domain() -> Result<String> {
     let uid = Command::new("id")
         .arg("-u")
         .output()
         .context("cannot determine current user ID")?;
+    if !uid.status.success() {
+        bail!("id -u failed");
+    }
     let uid = String::from_utf8_lossy(&uid.stdout).trim().to_owned();
-    let domain = format!("gui/{uid}");
+    Ok(format!("gui/{uid}"))
+}
+
+fn launch_agent_state() -> Result<Option<String>> {
+    let service = format!("{}/com.battery.app", launch_domain()?);
+    let output = Command::new("launchctl")
+        .args(["print", &service])
+        .output()
+        .context("could not inspect battery launch agent")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("Could not find service") {
+            return Ok(None);
+        }
+        bail!("launchctl print failed: {}", stderr.trim());
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let state = stdout
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("state = "))
+        .context("launchctl print did not report agent state")?;
+    Ok(Some(state.to_owned()))
+}
+
+fn launchctl(args: &[&str], plist: &Path) -> Result<()> {
+    let domain = launch_domain()?;
     let output = Command::new("launchctl")
         .args(args)
         .arg(domain)
@@ -1109,6 +1239,47 @@ fn bootstrap_launch_agent(plist: &Path) -> Result<()> {
     launchctl(&["bootstrap"], plist)
 }
 
-fn unload_launch_agent(plist: &Path) {
-    let _ = launchctl(&["bootout"], plist);
+fn wait_for_agent_running() -> Result<()> {
+    thread::sleep(Duration::from_millis(750));
+    let deadline = Instant::now() + AGENT_STOP_TIMEOUT;
+    loop {
+        match launch_agent_state()? {
+            Some(state) if state == "running" => return Ok(()),
+            state if Instant::now() >= deadline => {
+                bail!(
+                    "battery maintenance agent did not start (state: {}); check ~/.battery/battery.log",
+                    state.unwrap_or_else(|| "not loaded".to_owned())
+                );
+            }
+            _ => thread::sleep(Duration::from_millis(200)),
+        }
+    }
+}
+
+fn unload_launch_agent() -> Result<()> {
+    if launch_agent_state()?.is_none() {
+        return Ok(());
+    }
+    let service = format!("{}/com.battery.app", launch_domain()?);
+    let output = Command::new("launchctl")
+        .args(["bootout", &service])
+        .output()
+        .context("could not stop battery launch agent")?;
+    if !output.status.success() {
+        if launch_agent_state()?.is_some() {
+            bail!(
+                "launchctl bootout failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        return Ok(());
+    }
+    let deadline = Instant::now() + AGENT_STOP_TIMEOUT;
+    while launch_agent_state()?.is_some() {
+        if Instant::now() >= deadline {
+            bail!("battery maintenance agent did not stop within 10 seconds");
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+    Ok(())
 }
