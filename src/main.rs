@@ -35,7 +35,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Action {
-    /// Show battery percentage, remaining time and SMC charging state.
+    /// Show battery percentage, remaining time and charging state.
     Status,
     /// Keep the battery near a percentage; use `stop` to disable maintenance.
     Maintain { level: String },
@@ -96,6 +96,7 @@ impl Paths {
 #[serde(default)]
 struct AppConfig {
     maintenance: MaintenanceConfig,
+    controls: ControlConfig,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -103,6 +104,15 @@ struct AppConfig {
 struct MaintenanceConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     target: Option<u8>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct ControlConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    charging: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adapter: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -327,6 +337,7 @@ fn load_config(paths: &Paths) -> Result<AppConfig> {
             maintenance: MaintenanceConfig {
                 target: Some(target),
             },
+            controls: ControlConfig::default(),
         };
         save_config(paths, &config)?;
         fs::remove_file(&paths.legacy_target).context("cannot remove migrated target file")?;
@@ -835,9 +846,27 @@ fn enable_adapter_input() -> Result<()> {
 
 fn charging_status() -> String {
     let capabilities = smc_capabilities();
-    let (key, enabled, disabled) = if capabilities.golden_gate {
-        ("bfF0", vec![0x00], vec![0x02])
-    } else if capabilities.tahoe {
+    if capabilities.golden_gate {
+        return match Command::new("ioreg")
+            .args(["-rn", "AppleSmartBattery"])
+            .output()
+        {
+            Ok(output) if output.status.success() => {
+                let text = String::from_utf8_lossy(&output.stdout);
+                match text.lines().find_map(|line| {
+                    let (key, value) = line.split_once('=')?;
+                    (key.trim().trim_matches('"') == "IsCharging")
+                        .then(|| value.trim().trim_matches('"'))
+                }) {
+                    Some("Yes") => "enabled".to_owned(),
+                    Some("No") => "disabled".to_owned(),
+                    _ => "unknown".to_owned(),
+                }
+            }
+            _ => "unknown".to_owned(),
+        };
+    }
+    let (key, enabled, disabled) = if capabilities.tahoe {
         (
             "CHTE",
             vec![0x00, 0x00, 0x00, 0x00],
@@ -957,7 +986,7 @@ fn current_status() -> Result<BatteryStatus> {
 fn show_status() -> Result<()> {
     let status = current_status()?;
     log(&format!(
-        "Battery at {}% ({} remaining), SMC charging {}",
+        "Battery at {}% ({} remaining), charging {}",
         status.percentage, status.remaining, status.charging
     ));
     if !status.maintain_percentage.is_empty() {
@@ -1000,22 +1029,30 @@ fn set_charging(setting: &str) -> Result<()> {
     let enabled = validate_setting(setting)?;
     stop_maintenance()?;
     if enabled {
-        enable_charging()
+        enable_charging()?;
     } else {
-        disable_charging()
+        disable_charging()?;
     }
+    save_control_setting(|controls| controls.charging = Some(enabled))
 }
 
 fn set_adapter(setting: &str) -> Result<()> {
     let enabled = validate_setting(setting)?;
-    clear_maintenance()?;
     if enabled {
         // Adapter control is independent of the battery charging limit.
         enable_adapter_input()?;
     } else {
         disable_adapter_input()?;
     }
+    save_control_setting(|controls| controls.adapter = Some(enabled))?;
     show_status()
+}
+
+fn save_control_setting(update: impl FnOnce(&mut ControlConfig)) -> Result<()> {
+    let paths = paths()?;
+    let mut config = load_config(&paths)?;
+    update(&mut config.controls);
+    save_config(&paths, &config)
 }
 
 fn validate_level(level: u8) -> Result<u8> {
@@ -1090,6 +1127,12 @@ fn maintain(level: String) -> Result<()> {
         return stop_maintenance();
     }
     let target = parse_target(&level)?;
+    if !smc_capabilities().golden_gate {
+        bail!("independent charge limits require Golden Gate SMC keys (bfD0/bfE0/bfF0)");
+    }
+    if target < 2 {
+        bail!("Golden Gate charge limits require a target between 2 and 100");
+    }
     let paths = paths()?;
     unload_launch_agent()?;
     let mut config = load_config(&paths)?;
@@ -1112,31 +1155,16 @@ fn maintain_loop(level: &str) -> Result<()> {
     } else {
         parse_target(level)?
     };
-    let _adapter_restore = AdapterRestoreGuard::new();
-    // A previous worker may have exited while adapter input was disabled.
-    enable_adapter_input()?;
-    let (initial, _) = battery_reading()?;
-    if initial.parse::<u8>().unwrap_or(0) > target {
-        log(&format!(
-            "Discharging to {target}% before starting maintenance"
-        ));
-        wait_for_level(target, false)?;
+    if !smc_capabilities().golden_gate {
+        bail!("independent charge limits require Golden Gate SMC keys (bfD0/bfE0/bfF0)");
     }
+    if target < 2 {
+        bail!("Golden Gate charge limits require a target between 2 and 100");
+    }
+    write_golden_gate_limit(target, target.saturating_sub(2).max(1))?;
+    log(&format!("Firmware charge limit set to {target}%"));
     loop {
         check_shutdown()?;
-        if discharging_status() != "not discharging" {
-            enable_adapter_input()?;
-        }
-        let (raw, _) = battery_reading()?;
-        let current: u8 = raw.parse().context("invalid battery percentage")?;
-        let charging = charging_status();
-        if current >= target && charging == "enabled" {
-            log(&format!("Charge at or above {target}%; disabling charging"));
-            disable_charging()?;
-        } else if current < target && charging == "disabled" {
-            log(&format!("Charge below {target}%; enabling charging"));
-            enable_charging()?;
-        }
         sleep_until_next_check()?;
     }
 }
@@ -1156,8 +1184,10 @@ fn clear_maintenance() -> Result<()> {
 
 fn stop_maintenance() -> Result<()> {
     clear_maintenance()?;
-    log("Enabling battery charging");
-    enable_charging()?;
+    if smc_capabilities().golden_gate {
+        log("Clearing firmware charge limit");
+        run_golden_gate_privileged("reset", None, None)?;
+    }
     show_status()
 }
 
