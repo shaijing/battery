@@ -79,7 +79,6 @@ enum Action {
 struct Paths {
     config: PathBuf,
     config_file: PathBuf,
-    legacy_target: PathBuf,
     log: PathBuf,
     launch_agent: PathBuf,
 }
@@ -90,7 +89,6 @@ impl Paths {
         let config = home.join(".battery");
         Ok(Self {
             config_file: config.join("config.toml"),
-            legacy_target: config.join("maintain.percentage"),
             log: config.join("battery.log"),
             launch_agent: home.join("Library/LaunchAgents/battery.plist"),
             config,
@@ -347,28 +345,6 @@ fn load_config(paths: &Paths) -> Result<AppConfig> {
         {
             bail!("maintenance.target in config.toml must be between 1 and 100");
         }
-        return Ok(config);
-    }
-
-    // Migrate the original plain-text target on first use.
-    if paths.legacy_target.exists() {
-        let raw = fs::read_to_string(&paths.legacy_target)
-            .context("cannot read legacy maintenance target")?;
-        let target: u8 = raw
-            .trim()
-            .parse()
-            .context("invalid legacy maintenance target")?;
-        if !(1..=100).contains(&target) {
-            bail!("legacy maintenance target must be between 1 and 100");
-        }
-        let config = AppConfig {
-            maintenance: MaintenanceConfig {
-                target: Some(target),
-            },
-            controls: ControlConfig::default(),
-        };
-        save_config(paths, &config)?;
-        fs::remove_file(&paths.legacy_target).context("cannot remove migrated target file")?;
         return Ok(config);
     }
 
