@@ -139,6 +139,7 @@ struct SmcCapabilities {
     adapter_chie: bool,
     adapter_ch0i: bool,
     adapter_ch0j: bool,
+    magsafe_led: bool,
 }
 
 struct AdapterRestoreGuard {
@@ -388,7 +389,8 @@ Cmnd_Alias BATTERY_CHARGING_ON = {helper_path} smc-write CH0B 00, {helper_path} 
 Cmnd_Alias BATTERY_CHARGING_OFF = {helper_path} smc-write CH0B 02, {helper_path} smc-write CH0C 02, {helper_path} smc-write CHTE 01000000\n\
 Cmnd_Alias BATTERY_ADAPTER_INPUT_OFF = {helper_path} smc-write CH0I 01, {helper_path} smc-write CHIE 08, {helper_path} smc-write CH0J 01\n\
 Cmnd_Alias BATTERY_ADAPTER_INPUT_ON = {helper_path} smc-write CH0I 00, {helper_path} smc-write CHIE 00, {helper_path} smc-write CH0J 00\n\
-{username} ALL=(root) NOPASSWD: BATTERY_CHARGING_ON, BATTERY_CHARGING_OFF, BATTERY_ADAPTER_INPUT_ON, BATTERY_ADAPTER_INPUT_OFF\n\
+Cmnd_Alias BATTERY_MAGSAFE_LED = {helper_path} smc-write ACLC 00, {helper_path} smc-write ACLC 03\n\
+{username} ALL=(root) NOPASSWD: BATTERY_CHARGING_ON, BATTERY_CHARGING_OFF, BATTERY_ADAPTER_INPUT_ON, BATTERY_ADAPTER_INPUT_OFF, BATTERY_MAGSAFE_LED\n\
 # Dynamic Golden Gate values are passed through a root-only Rust wrapper that validates each argument.\n\
 {username} ALL=(root) NOPASSWD: {helper_path} golden-gate *\n"
     );
@@ -584,6 +586,7 @@ fn smc_write_root(key: &str, value: &str) -> Result<()> {
             | ("CH0I", [0x00] | [0x01])
             | ("CHIE", [0x00] | [0x08])
             | ("CH0J", [0x00] | [0x01])
+            | ("ACLC", [0x00] | [0x03])
     );
     if !allowed {
         bail!("unsupported privileged SMC write: {key}={value}");
@@ -632,6 +635,7 @@ fn smc_capabilities() -> &'static SmcCapabilities {
             adapter_chie: probe_key("CHIE", None, 1),
             adapter_ch0i: probe_key("CH0I", None, 1),
             adapter_ch0j: probe_key("CH0J", None, 1),
+            magsafe_led: probe_key("ACLC", None, 1),
         };
         if !running_as_root().unwrap_or(false) {
             let charging = if capabilities.golden_gate {
@@ -889,6 +893,30 @@ fn discharging_status() -> String {
         Ok(_) => "discharging".to_owned(),
         Err(_) => "unknown".to_owned(),
     }
+}
+
+fn update_magsafe_led(target: u8) -> Result<()> {
+    if !smc_capabilities().magsafe_led {
+        return Ok(());
+    }
+    let (percentage, _) = battery_reading()?;
+    let percentage: u8 = percentage.parse().context("invalid battery percentage")?;
+    let plugged_in = discharging_status() == "not discharging";
+    let color = if plugged_in && percentage >= target {
+        0x03 // Green
+    } else {
+        0x00 // Let the system choose the indicator color.
+    };
+    let current = smc_read("ACLC")?;
+    if current.bytes != [color] {
+        smc_write_verified("ACLC", &[color])?;
+        log(if color == 0x03 {
+            "MagSafe indicator set to green at charge limit"
+        } else {
+            "MagSafe indicator returned to system control"
+        });
+    }
+    Ok(())
 }
 
 fn battery_reading() -> Result<(String, String)> {
@@ -1219,6 +1247,9 @@ fn maintain_loop(level: &str) -> Result<()> {
     log(&format!("Firmware charge limit set to {target}%"));
     loop {
         check_shutdown()?;
+        if let Err(error) = update_magsafe_led(target) {
+            tracing::warn!(target: "battery", error = %error, "could not update MagSafe indicator");
+        }
         sleep_until_next_check()?;
     }
 }
